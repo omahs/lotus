@@ -4,16 +4,19 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/filecoin-project/go-address"
+	"github.com/filecoin-project/go-state-types/big"
 	builtintypes "github.com/filecoin-project/go-state-types/builtin"
 	"github.com/filecoin-project/go-state-types/exitcode"
 	"github.com/filecoin-project/go-state-types/manifest"
 
+	"github.com/filecoin-project/lotus/build"
 	"github.com/filecoin-project/lotus/chain/types"
 	"github.com/filecoin-project/lotus/chain/types/ethtypes"
 	"github.com/filecoin-project/lotus/itests/kit"
@@ -215,4 +218,117 @@ func TestFEVMRecursiveActorCall(t *testing.T) {
 
 	t.Run("n=0,r=255-fails", testN(0, 255, exitcode.ExitCode(33))) // 33 means transaction reverted
 	t.Run("n=251,r=171-fails", testN(251, 171, exitcode.ExitCode(33)))
+}
+
+// TestFEVMRecursiveActorCallEstimate
+func TestFEVMRecursiveActorCallEstimate(t *testing.T) {
+	ctx, cancel, client := setupFEVMTest(t)
+	defer cancel()
+
+	//install contract Actor
+	filenameActor := "contracts/ExternalRecursiveCallSimple.hex"
+	contractHex, err := os.ReadFile(filenameActor)
+	require.NoError(t, err)
+
+	contract, err := hex.DecodeString(string(contractHex))
+	require.NoError(t, err)
+
+	// create a new Ethereum account
+	key, ethAddr, deployer := client.EVM().NewAccount()
+
+	// send some funds to the f410 address
+	kit.SendFunds(ctx, t, client, deployer, types.FromFil(1000))
+
+	// deploy the contract
+	tx, err := deployContractTx(ctx, client, ethAddr, contract)
+	require.NoError(t, err)
+
+	client.EVM().SignTransaction(tx, key.PrivateKey)
+	hash := client.EVM().SubmitTransaction(ctx, tx)
+
+	receipt, err := waitForEthTxReceipt(ctx, client, hash)
+	require.NoError(t, err)
+	require.NotNil(t, receipt)
+
+	// Success.
+	require.EqualValues(t, ethtypes.EthUint64(0x1), receipt.Status)
+
+	// Get contract address.
+	contractAddr := client.EVM().ComputeContractAddress(ethAddr, 0)
+
+	///
+
+	createParams := func(r int) []byte {
+		funcSignature := "exec1(uint256)"
+		entryPoint := kit.CalcFuncSignature(funcSignature)
+
+		inputData := make([]byte, 32)
+		binary.BigEndian.PutUint64(inputData[24:], uint64(r))
+
+		params := append(entryPoint, inputData...)
+
+		return params
+	}
+
+	testN := func(r int) func(t *testing.T) {
+		return func(t *testing.T) {
+			t.Logf("running with %d recursive calls", r)
+
+			params := createParams(r)
+			gaslimit, err := client.EthEstimateGas(ctx, ethtypes.EthCall{
+				From: &ethAddr,
+				To:   &contractAddr,
+				Data: params,
+			})
+			require.NoError(t, err)
+			require.LessOrEqual(t, int64(gaslimit), build.BlockGasLimit)
+
+			t.Logf("EthEstimateGas GasLimit=%d", gaslimit)
+
+			maxPriorityFeePerGas, err := client.EthMaxPriorityFeePerGas(ctx)
+			require.NoError(t, err)
+
+			nonce, err := client.MpoolGetNonce(ctx, deployer)
+			require.NoError(t, err)
+
+			tx = &ethtypes.EthTxArgs{
+				ChainID:              build.Eip155ChainId,
+				To:                   &contractAddr,
+				Value:                big.Zero(),
+				Nonce:                int(nonce),
+				MaxFeePerGas:         types.NanoFil,
+				MaxPriorityFeePerGas: big.Int(maxPriorityFeePerGas),
+				GasLimit:             int(gaslimit),
+				Input:                params,
+				V:                    big.Zero(),
+				R:                    big.Zero(),
+				S:                    big.Zero(),
+			}
+
+			client.EVM().SignTransaction(tx, key.PrivateKey)
+			hash := client.EVM().SubmitTransaction(ctx, tx)
+
+			receipt, err := waitForEthTxReceipt(ctx, client, hash)
+			require.NoError(t, err)
+			require.NotNil(t, receipt)
+
+			t.Logf("Receipt GasUsed=%d", receipt.GasUsed)
+			t.Logf("Ratio %0.2f", float64(receipt.GasUsed)/float64(gaslimit))
+			t.Logf("Overestimate %0.2f", ((float64(gaslimit)/float64(receipt.GasUsed))-1)*100)
+
+			require.EqualValues(t, ethtypes.EthUint64(1), receipt.Status)
+		}
+	}
+
+	t.Run("n=1", testN(1))
+	t.Run("n=2", testN(2))
+	t.Run("n=3", testN(3))
+	t.Run("n=5", testN(4))
+	t.Run("n=5", testN(5))
+	t.Run("n=10", testN(10))
+	t.Run("n=20", testN(20))
+	t.Run("n=30", testN(30))
+	t.Run("n=40", testN(40))
+	t.Run("n=50", testN(50))
+	t.Run("n=100", testN(100))
 }
