@@ -640,3 +640,41 @@ func TestFEVMRecursiveActorCall(t *testing.T) {
 	t.Run("n=0,r=255-fails", testN(0, 255, exitcode.ExitCode(33))) // 33 means transaction reverted
 	t.Run("n=251,r=171-fails", testN(251, 171, exitcode.ExitCode(33)))
 }
+
+func TestFEVMTestSendGasCost(t *testing.T) {
+
+  ctx, cancel, client := kit.SetupFEVMTest(t)
+  defer cancel()
+
+  fromAddr := client.DefaultKey.Address
+
+  bal, err := client.WalletBalance(ctx, fromAddr)
+  require.NoError(t, err)
+  t.Log("initial balance- ", bal)
+
+  originalBalance, err := big.FromString("100000000000000000000000000")
+  require.NoError(t, err)
+  require.Equal(t, originalBalance, bal)
+
+  //transfer 0 wei to yourself
+  sendAmount := big.NewInt(0)
+	client.EVM().TransferValueOrFail(ctx, fromAddr, fromAddr, sendAmount)
+
+  //calculate gas used to send 0 to yourself
+  bal, err = client.WalletBalance(ctx, client.DefaultKey.Address)
+  require.NoError(t, err)
+  gasUsedFirstSend := big.Subtract(originalBalance, bal)
+  t.Log("balance change from send - ", 0, gasUsedFirstSend)
+
+  //send 0 again to yourself 15 times and calculate gas
+  for i := 1; i <= 15; i++ {
+    bal, err = client.WalletBalance(ctx, client.DefaultKey.Address)
+    require.NoError(t, err)
+    client.EVM().TransferValueOrFail(ctx, fromAddr, fromAddr, sendAmount)
+    balAfterTx, err := client.WalletBalance(ctx, client.DefaultKey.Address)
+    require.NoError(t, err)
+    gasUsed := big.Subtract(bal, balAfterTx)
+    t.Log("balance change from send - ", i, gasUsed)
+
+  }
+}
